@@ -1,0 +1,6 @@
+{
+  "name": "@upaying/logger",
+  "version": "1.0.0",
+  "description": "UpPaying logging utility",
+  "main": "src/index.ts"
+}

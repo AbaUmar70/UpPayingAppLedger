@@ -1,0 +1,19 @@
+{
+  "name": "@upaying/database",
+  "version": "1.0.0",
+  "description": "UpPaying database connection and Prisma client",
+  "main": "src/index.ts",
+  "scripts": {
+    "generate": "prisma generate",
+    "push": "prisma db push",
+    "migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.10.0",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "prisma": "^5.10.0",
+    "typescript": "^5.3.0"
+  }
+}

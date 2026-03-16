@@ -1,0 +1,21 @@
+{
+  "name": "upaying-backend",
+  "version": "1.0.0",
+  "description": "UpPaying Micro-Banking & Payment Platform Backend",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=apps/wallet-service",
+    "build": "npm run build --workspaces",
+    "test": "jest",
+    "lint": "eslint . --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0"
+  }
+}
