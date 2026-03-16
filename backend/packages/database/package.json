@@ -9,8 +9,8 @@
     "migrate": "prisma migrate dev"
   },
   "dependencies": {
-    "@prisma/client": "^5.10.0",
-    "pg": "^8.11.3"
+    "@prisma/client": "^7.5.0",
+    "pg": "^8.20.0"
   },
   "devDependencies": {
     "prisma": "^5.10.0",

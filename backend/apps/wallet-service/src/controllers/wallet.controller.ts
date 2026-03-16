@@ -1,7 +1,22 @@
 import { walletService } from '../services/wallet.service';
-import { createLogger } from '@upaying/logger';
 
-const logger = createLogger('WalletController');
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+interface LogContext {
+  [key: string]: unknown;
+}
+
+class Logger {
+  private service: string;
+  constructor(service: string) { this.service = service; }
+  private formatMessage(level: LogLevel, message: string, context?: LogContext): string {
+    return `[${new Date().toISOString()}] ${level.toUpperCase()} [${this.service}] ${message}`;
+  }
+  info(message: string, ctx?: LogContext): void { console.log(this.formatMessage('info', message, ctx)); }
+  error(message: string, ctx?: LogContext): void { console.error(this.formatMessage('error', message, ctx)); }
+}
+
+const logger = new Logger('WalletController');
 
 export interface CreateWalletRequest {
   userId: string;

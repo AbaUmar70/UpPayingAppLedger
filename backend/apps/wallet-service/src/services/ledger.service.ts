@@ -1,6 +1,46 @@
-import { prisma } from '@upaying/database';
-import { createLogger } from '@upaying/logger';
-import { v4 as uuidv4 } from 'uuid';
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/upaying',
+});
+
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+interface LogContext {
+  [key: string]: unknown;
+}
+
+class Logger {
+  private service: string;
+  private isProduction: boolean;
+
+  constructor(service: string) {
+    this.service = service;
+    this.isProduction = process.env.NODE_ENV === 'production';
+  }
+
+  private formatMessage(level: LogLevel, message: string, context?: LogContext): string {
+    const timestamp = new Date().toISOString();
+    const contextStr = context ? ` ${JSON.stringify(context)}` : '';
+    return `[${timestamp}] ${level.toUpperCase()} [${this.service}] ${message}${contextStr}`;
+  }
+
+  private log(level: LogLevel, message: string, context?: LogContext): void {
+    const formattedMessage = this.formatMessage(level, message, context);
+    if (level === 'error') console.error(formattedMessage);
+    else if (level === 'warn') console.warn(formattedMessage);
+    else console.log(formattedMessage);
+  }
+
+  debug(message: string, context?: LogContext): void { if (!this.isProduction) this.log('debug', message, context); }
+  info(message: string, context?: LogContext): void { this.log('info', message, context); }
+  warn(message: string, context?: LogContext): void { this.log('warn', message, context); }
+  error(message: string, context?: LogContext): void { this.log('error', message, context); }
+}
+
+function createLogger(service: string): Logger {
+  return new Logger(service);
+}
 
 const logger = createLogger('LedgerService');
 
@@ -53,6 +93,20 @@ export interface Account {
   isActive: boolean;
 }
 
+async function query<T>(sql: string, params: any[] = []): Promise<T[]> {
+  const result = await pool.query(sql, params);
+  return result.rows as T[];
+}
+
+async function queryOne<T>(sql: string, params: any[] = []): Promise<T | null> {
+  const rows = await query<T>(sql, params);
+  return rows[0] || null;
+}
+
+async function execute(sql: string, params: any[] = []): Promise<void> {
+  await pool.query(sql, params);
+}
+
 export class LedgerService {
   async createAccount(data: {
     accountNumber: string;
@@ -62,83 +116,57 @@ export class LedgerService {
     userId?: string;
     walletId?: string;
   }): Promise<Account> {
-    const account = await prisma.ledgerAccounts.create({
-      data: {
-        accountNumber: data.accountNumber,
-        accountName: data.accountName,
-        accountType: data.accountType,
-        currency: data.currency || 'NGN',
-        userId: data.userId,
-        walletId: data.walletId,
-        isActive: true,
-      },
-    });
+    const id = crypto.randomUUID();
+    await execute(
+      `INSERT INTO ledger_accounts (id, account_number, account_name, account_type, currency, user_id, wallet_id, is_active) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, true)`,
+      [id, data.accountNumber, data.accountName, data.accountType, data.currency || 'NGN', data.userId || null, data.walletId || null]
+    );
 
-    await prisma.accountBalances.create({
-      data: {
-        accountId: account.id,
-        balance: 0,
-        debitBalance: 0,
-        creditBalance: 0,
-      },
-    });
+    await execute(
+      `INSERT INTO account_balances (id, account_id, balance, debit_balance, credit_balance) VALUES ($1, $2, 0, 0, 0)`,
+      [crypto.randomUUID(), id]
+    );
 
-    logger.info('Ledger account created', { accountId: account.id, accountNumber: data.accountNumber });
-    return account;
+    logger.info('Ledger account created', { accountId: id, accountNumber: data.accountNumber });
+    return { id, accountNumber: data.accountNumber, accountName: data.accountName, accountType: data.accountType, currency: data.currency || 'NGN', isActive: true };
   }
 
   async getAccountById(accountId: string): Promise<Account | null> {
-    return prisma.ledgerAccounts.findUnique({
-      where: { id: accountId },
-    });
+    return queryOne<Account>(`SELECT * FROM ledger_accounts WHERE id = $1`, [accountId]);
   }
 
   async getAccountByNumber(accountNumber: string): Promise<Account | null> {
-    return prisma.ledgerAccounts.findUnique({
-      where: { account_number: accountNumber },
-    });
+    return queryOne<Account>(`SELECT * FROM ledger_accounts WHERE account_number = $1`, [accountNumber]);
   }
 
   async getAccountBalance(accountId: string): Promise<bigint> {
-    const result = await prisma.$queryRaw<{ balance: bigint }[]>`
-      SELECT get_account_balance(${accountId}::uuid) as balance
-    `;
-    return result[0]?.balance || BigInt(0);
+    const result = await queryOne<{ balance: bigint }>(`SELECT get_account_balance($1) as balance`, [accountId]);
+    return result?.balance || BigInt(0);
   }
 
   async postTransaction(tx: LedgerTransaction): Promise<string> {
-    const client = await prisma.$connect();
+    const client = await pool.connect();
     
     try {
-      await client.$executeRaw`BEGIN`;
+      await client.query('BEGIN');
 
-      const transaction = await client.ledgerTransactions.create({
-        data: {
-          reference: tx.reference,
-          description: tx.description,
-          transactionType: tx.transactionType,
-          status: 'completed',
-          totalAmount: tx.totalAmount,
-          currency: tx.currency || 'NGN',
-          metadata: tx.metadata || {},
-          completedAt: new Date(),
-        },
-      });
+      const transactionId = crypto.randomUUID();
+      await client.query(
+        `INSERT INTO ledger_transactions (id, reference, description, transaction_type, status, total_amount, currency, metadata, completed_at) 
+         VALUES ($1, $2, $3, $4, 'completed', $5, $6, $7, NOW())`,
+        [transactionId, tx.reference, tx.description, tx.transactionType, tx.totalAmount, tx.currency || 'NGN', JSON.stringify(tx.metadata || {})]
+      );
 
       let totalDebit = BigInt(0);
       let totalCredit = BigInt(0);
 
       for (const entry of tx.entries) {
-        await client.ledgerEntries.create({
-          data: {
-            transactionId: transaction.id,
-            accountId: entry.accountId,
-            entryType: entry.entryType,
-            amount: entry.amount,
-            currency: entry.currency || 'NGN',
-            description: entry.description,
-          },
-        });
+        await client.query(
+          `INSERT INTO ledger_entries (id, transaction_id, account_id, entry_type, amount, currency, description) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [crypto.randomUUID(), transactionId, entry.accountId, entry.entryType, entry.amount, entry.currency || 'NGN', entry.description || null]
+        );
 
         if (entry.entryType === 'DEBIT') {
           totalDebit += entry.amount;
@@ -153,208 +181,139 @@ export class LedgerService {
       }
 
       for (const entry of tx.entries) {
-        await this.updateAccountBalance(client, entry.accountId, entry.entryType, entry.amount);
+        if (entry.entryType === 'DEBIT') {
+          await client.query(
+            `UPDATE account_balances SET debit_balance = debit_balance + $1, balance = balance - $1, last_transaction_at = NOW(), updated_at = NOW() WHERE account_id = $2`,
+            [entry.amount, entry.accountId]
+          );
+        } else {
+          await client.query(
+            `UPDATE account_balances SET credit_balance = credit_balance + $1, balance = balance + $1, last_transaction_at = NOW(), updated_at = NOW() WHERE account_id = $2`,
+            [entry.amount, entry.accountId]
+          );
+        }
       }
 
-      await client.$executeRaw`COMMIT`;
+      await client.query('COMMIT');
       
-      logger.info('Ledger transaction posted', { 
-        transactionId: transaction.id, 
-        reference: tx.reference,
-        amount: tx.totalAmount 
-      });
+      logger.info('Ledger transaction posted', { transactionId, reference: tx.reference, amount: tx.totalAmount });
       
-      return transaction.id;
+      return transactionId;
     } catch (error) {
-      await client.$executeRaw`ROLLBACK`;
-      logger.error('Failed to post ledger transaction', { 
-        reference: tx.reference, 
-        error: String(error) 
-      });
+      await client.query('ROLLBACK');
+      logger.error('Failed to post ledger transaction', { reference: tx.reference, error: String(error) });
       throw error;
     } finally {
-      await client.$disconnect();
+      client.release();
     }
   }
 
-  private async updateAccountBalance(
-    client: any,
-    accountId: string,
-    entryType: EntryType,
-    amount: bigint
-  ): Promise<void> {
-    if (entryType === 'DEBIT') {
-      await client.$executeRaw`
-        UPDATE account_balances 
-        SET debit_balance = debit_balance + ${amount},
-            balance = balance - ${amount},
-            last_transaction_at = NOW(),
-            updated_at = NOW()
-        WHERE account_id = ${accountId}
-      `;
-    } else {
-      await client.$executeRaw`
-        UPDATE account_balances 
-        SET credit_balance = credit_balance + ${amount},
-            balance = balance + ${amount},
-            last_transaction_at = NOW(),
-            updated_at = NOW()
-        WHERE account_id = ${accountId}
-      `;
-    }
-  }
-
-  async reverseTransaction(
-    originalTransactionId: string,
-    reason: string,
-    reversedBy: string
-  ): Promise<string> {
-    const client = await prisma.$connect();
+  async reverseTransaction(originalTransactionId: string, reason: string, reversedBy: string): Promise<string> {
+    const client = await pool.connect();
 
     try {
-      await client.$executeRaw`BEGIN`;
+      await client.query('BEGIN');
 
-      const originalTx = await client.ledgerTransactions.findUnique({
-        where: { id: originalTransactionId },
-      });
+      const originalTx = await client.query('SELECT * FROM ledger_transactions WHERE id = $1', [originalTransactionId]);
+      if (originalTx.rows.length === 0) throw new Error('Original transaction not found');
+      if (originalTx.rows[0].status === 'reversed') throw new Error('Transaction already reversed');
 
-      if (!originalTx) {
-        throw new Error('Original transaction not found');
-      }
+      const reversalReference = `REV-${originalTx.rows[0].reference}`;
+      const reversalTxId = crypto.randomUUID();
+      
+      await client.query(
+        `INSERT INTO ledger_transactions (id, reference, description, transaction_type, status, total_amount, currency, metadata, reversed_by, reversed_at, completed_at) 
+         VALUES ($1, $2, $3, 'reversal', 'completed', $4, $5, $6, $7, NOW(), NOW())`,
+        [reversalTxId, reversalReference, `Reversal: ${reason}`, originalTx.rows[0].total_amount, originalTx.rows[0].currency, JSON.stringify({ originalTransactionId }), reversedBy]
+      );
 
-      if (originalTx.status === 'reversed') {
-        throw new Error('Transaction already reversed');
-      }
+      const originalEntries = await client.query('SELECT * FROM ledger_entries WHERE transaction_id = $1', [originalTransactionId]);
 
-      const reversalReference = `REV-${originalTx.reference}`;
-      const reversalTx = await client.ledgerTransactions.create({
-        data: {
-          reference: reversalReference,
-          description: `Reversal: ${reason}`,
-          transactionType: 'reversal',
-          status: 'completed',
-          totalAmount: originalTx.totalAmount,
-          currency: originalTx.currency,
-          metadata: { originalTransactionId },
-          reversedBy: reversedBy,
-          reversedAt: new Date(),
-          completedAt: new Date(),
-        },
-      });
-
-      const originalEntries = await client.ledgerEntries.findMany({
-        where: { transactionId: originalTransactionId },
-      });
-
-      for (const entry of originalEntries) {
-        const reversedEntryType = entry.entryType === 'DEBIT' ? 'CREDIT' : 'DEBIT';
+      for (const entry of originalEntries.rows) {
+        const reversedEntryType = entry.entry_type === 'DEBIT' ? 'CREDIT' : 'DEBIT';
         
-        await client.ledgerEntries.create({
-          data: {
-            transactionId: reversalTx.id,
-            accountId: entry.accountId,
-            entryType: reversedEntryType,
-            amount: entry.amount,
-            currency: entry.currency,
-            description: `Reversal of entry ${entry.id}`,
-          },
-        });
+        await client.query(
+          `INSERT INTO ledger_entries (id, transaction_id, account_id, entry_type, amount, currency, description) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [crypto.randomUUID(), reversalTxId, entry.account_id, reversedEntryType, entry.amount, entry.currency, `Reversal of entry ${entry.id}`]
+        );
 
-        await this.updateAccountBalance(client, entry.accountId, reversedEntryType, entry.amount);
+        if (reversedEntryType === 'DEBIT') {
+          await client.query(
+            `UPDATE account_balances SET debit_balance = debit_balance + $1, balance = balance - $1 WHERE account_id = $2`,
+            [entry.amount, entry.account_id]
+          );
+        } else {
+          await client.query(
+            `UPDATE account_balances SET credit_balance = credit_balance + $1, balance = balance + $1 WHERE account_id = $2`,
+            [entry.amount, entry.account_id]
+          );
+        }
       }
 
-      await client.ledgerTransactions.update({
-        where: { id: originalTransactionId },
-        data: { status: 'reversed' },
-      });
+      await client.query(`UPDATE ledger_transactions SET status = 'reversed' WHERE id = $1`, [originalTransactionId]);
 
-      await client.ledgerReversals.create({
-        data: {
-          originalTransactionId,
-          reversalTransactionId: reversalTx.id,
-          reason,
-          reversedBy,
-        },
-      });
+      await client.query(
+        `INSERT INTO ledger_reversals (id, original_transaction_id, reversal_transaction_id, reason, reversed_by) VALUES ($1, $2, $3, $4, $5)`,
+        [crypto.randomUUID(), originalTransactionId, reversalTxId, reason, reversedBy]
+      );
 
-      await client.$executeRaw`COMMIT`;
+      await client.query('COMMIT');
 
-      logger.info('Transaction reversed', { 
-        originalTransactionId, 
-        reversalTransactionId: reversalTx.id 
-      });
+      logger.info('Transaction reversed', { originalTransactionId, reversalTransactionId: reversalTxId });
 
-      return reversalTx.id;
+      return reversalTxId;
     } catch (error) {
-      await client.$executeRaw`ROLLBACK`;
-      logger.error('Failed to reverse transaction', { 
-        originalTransactionId, 
-        error: String(error) 
-      });
+      await client.query('ROLLBACK');
+      logger.error('Failed to reverse transaction', { originalTransactionId, error: String(error) });
       throw error;
     } finally {
-      await client.$disconnect();
+      client.release();
     }
   }
 
-  async getTransactionHistory(
-    accountId: string,
-    options?: {
-      startDate?: Date;
-      endDate?: Date;
-      limit?: number;
-      offset?: number;
-    }
-  ): Promise<any[]> {
-    const where: any = { accountId };
+  async getTransactionHistory(accountId: string, options?: { startDate?: Date; endDate?: Date; limit?: number; offset?: number }): Promise<any[]> {
+    let sql = `SELECT le.*, lt.reference as tx_reference, lt.description as tx_description, lt.transaction_type, lt.created_at as tx_created_at 
+               FROM ledger_entries le 
+               JOIN ledger_transactions lt ON le.transaction_id = lt.id 
+               WHERE le.account_id = $1`;
+    const params: any[] = [accountId];
 
-    if (options?.startDate || options?.endDate) {
-      where.createdAt = {};
-      if (options?.startDate) where.createdAt.gte = options.startDate;
-      if (options?.endDate) where.createdAt.lte = options.endDate;
+    if (options?.startDate) {
+      params.push(options.startDate);
+      sql += ` AND lt.created_at >= $${params.length}`;
+    }
+    if (options?.endDate) {
+      params.push(options.endDate);
+      sql += ` AND lt.created_at <= $${params.length}`;
     }
 
-    return prisma.ledgerEntries.findMany({
-      where,
-      include: {
-        transaction: true,
-        account: true,
-      },
-      orderBy: { createdAt: 'desc' },
-      take: options?.limit || 50,
-      skip: options?.offset || 0,
-    });
+    sql += ` ORDER BY le.created_at DESC`;
+    
+    if (options?.limit) {
+      params.push(options.limit);
+      sql += ` LIMIT $${params.length}`;
+    }
+    if (options?.offset) {
+      params.push(options.offset);
+      sql += ` OFFSET $${params.length}`;
+    }
+
+    return query(sql, params);
   }
 
-  async getAccountStatement(
-    accountId: string,
-    startDate: Date,
-    endDate: Date
-  ): Promise<any[]> {
-    return prisma.ledgerEntries.findMany({
-      where: {
-        accountId,
-        createdAt: {
-          gte: startDate,
-          lte: endDate,
-        },
-      },
-      include: {
-        transaction: true,
-      },
-      orderBy: { createdAt: 'asc' },
-    });
+  async getAccountStatement(accountId: string, startDate: Date, endDate: Date): Promise<any[]> {
+    return query(
+      `SELECT le.*, lt.reference, lt.description, lt.transaction_type FROM ledger_entries le 
+       JOIN ledger_transactions lt ON le.transaction_id = lt.id 
+       WHERE le.account_id = $1 AND le.created_at >= $2 AND le.created_at <= $3 
+       ORDER BY le.created_at ASC`,
+      [accountId, startDate, endDate]
+    );
   }
 
-  async reconcileAccount(accountId: string): Promise<{
-    ledgerBalance: bigint;
-    calculatedBalance: bigint;
-    isBalanced: boolean;
-  }> {
-    const accountBalance = await prisma.accountBalances.findUnique({
-      where: { accountId },
-    });
-
+  async reconcileAccount(accountId: string): Promise<{ ledgerBalance: bigint; calculatedBalance: bigint; isBalanced: boolean }> {
+    const accountBalance = await queryOne<{ balance: bigint }>(`SELECT balance FROM account_balances WHERE account_id = $1`, [accountId]);
     const calculatedBalance = await this.getAccountBalance(accountId);
 
     return {

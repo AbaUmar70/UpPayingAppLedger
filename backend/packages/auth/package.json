@@ -4,7 +4,9 @@
   "description": "UpPaying authentication utilities",
   "main": "src/index.ts",
   "dependencies": {
-    "jsonwebtoken": "^9.0.2",
-    "bcrypt": "^5.1.1"
+    "@types/bcrypt": "^6.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
+    "bcrypt": "^6.0.0",
+    "jsonwebtoken": "^9.0.3"
   }
 }
